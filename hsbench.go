@@ -1,25 +1,21 @@
 // hsbench.go
 // Copyright (c) 2017 Wasabi Technology, Inc.
 // Copyright (c) 2019 Red Hat Inc.
+// Copyright (c) 2022 Google LLC
 
 package main
 
 import (
 	"bytes"
+	"cloud.google.com/go/storage"
 	"code.cloudfoundry.org/bytefmt"
-	"crypto/hmac"
+	"context"
 	"crypto/md5"
-	"crypto/sha1"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
 	"io"
 	"io/ioutil"
 	"log"
@@ -37,7 +33,7 @@ import (
 )
 
 // Global variables
-var access_key, secret_key, url_host, bucket_prefix, object_prefix, region, modes, output, json_output, sizeArg string
+var key_file, url_host, bucket_prefix, object_prefix, region, modes, output, json_output, sizeArg string
 var buckets []string
 var duration_secs, threads, loops int
 var object_data []byte
@@ -47,93 +43,93 @@ var object_count_flag bool
 var endtime time.Time
 var interval float64
 
-// Our HTTP transport used for the roundtripper below
-var HTTPTransport http.RoundTripper = &http.Transport{
-	Proxy: http.ProxyFromEnvironment,
-	Dial: (&net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}).Dial,
-	TLSHandshakeTimeout:   10 * time.Second,
-	ExpectContinueTimeout: 0,
-	// Set the number of idle connections to 2X the number of threads
-	MaxIdleConnsPerHost: 2 * threads,
-	MaxIdleConns:        2 * threads,
-	// But limit their idle time to 1 minute
-	IdleConnTimeout: time.Minute,
-	// Ignore TLS errors
-	TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-}
-
-var httpClient = &http.Client{Transport: HTTPTransport}
-
-func getS3Client() *s3.S3 {
-	// Build our config
-	creds := credentials.NewStaticCredentials(access_key, secret_key, "")
-	loglevel := aws.LogOff
-	// Build the rest of the configuration
-	awsConfig := &aws.Config{
-		Region:               aws.String(region),
-		Endpoint:             aws.String(url_host),
-		Credentials:          creds,
-		LogLevel:             &loglevel,
-		S3ForcePathStyle:     aws.Bool(true),
-		S3Disable100Continue: aws.Bool(true),
-		// Comment following to use default transport
-		HTTPClient: &http.Client{Transport: HTTPTransport},
-	}
-	session := session.New(awsConfig)
-	client := s3.New(session)
-	if client == nil {
-		log.Fatalf("FATAL: Unable to create new client.")
-	}
-	// Return success
-	return client
-}
-
-// canonicalAmzHeaders -- return the x-amz headers canonicalized
-func canonicalAmzHeaders(req *http.Request) string {
-	// Parse out all x-amz headers
-	var headers []string
-	for header := range req.Header {
-		norm := strings.ToLower(strings.TrimSpace(header))
-		if strings.HasPrefix(norm, "x-amz") {
-			headers = append(headers, norm)
-		}
-	}
-	// Put them in sorted order
-	sort.Strings(headers)
-	// Now add back the values
-	for n, header := range headers {
-		headers[n] = header + ":" + strings.Replace(req.Header.Get(header), "\n", " ", -1)
-	}
-	// Finally, put them back together
-	if len(headers) > 0 {
-		return strings.Join(headers, "\n") + "\n"
-	} else {
-		return ""
-	}
-}
-
-func hmacSHA1(key []byte, content string) []byte {
-	mac := hmac.New(sha1.New, key)
-	mac.Write([]byte(content))
-	return mac.Sum(nil)
-}
-
-func setSignature(req *http.Request) {
-	// Setup default parameters
-	dateHdr := time.Now().UTC().Format("20060102T150405Z")
-	req.Header.Set("X-Amz-Date", dateHdr)
-	// Get the canonical resource and header
-	canonicalResource := req.URL.EscapedPath()
-	canonicalHeaders := canonicalAmzHeaders(req)
-	stringToSign := req.Method + "\n" + req.Header.Get("Content-MD5") + "\n" + req.Header.Get("Content-Type") + "\n\n" +
-		canonicalHeaders + canonicalResource
-	hash := hmacSHA1([]byte(secret_key), stringToSign)
-	signature := base64.StdEncoding.EncodeToString(hash)
-	req.Header.Set("Authorization", fmt.Sprintf("AWS %s:%s", access_key, signature))
-}
+// // Our HTTP transport used for the roundtripper below
+// var HTTPTransport http.RoundTripper = &http.Transport{
+// 	Proxy: http.ProxyFromEnvironment,
+// 	Dial: (&net.Dialer{
+// 		Timeout:   30 * time.Second,
+// 		KeepAlive: 30 * time.Second,
+// 	}).Dial,
+// 	TLSHandshakeTimeout:   10 * time.Second,
+// 	ExpectContinueTimeout: 0,
+// 	// Set the number of idle connections to 2X the number of threads
+// 	MaxIdleConnsPerHost: 2 * threads,
+// 	MaxIdleConns:        2 * threads,
+// 	// But limit their idle time to 1 minute
+// 	IdleConnTimeout: time.Minute,
+// 	// Ignore TLS errors
+// 	TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+// }
+//
+// var httpClient = &http.Client{Transport: HTTPTransport}
+//
+// func getS3Client() *s3.S3 {
+// 	// Build our config
+// 	creds := credentials.NewStaticCredentials(access_key, secret_key, "")
+// 	loglevel := aws.LogOff
+// 	// Build the rest of the configuration
+// 	awsConfig := &aws.Config{
+// 		Region:               aws.String(region),
+// 		Endpoint:             aws.String(url_host),
+// 		Credentials:          creds,
+// 		LogLevel:             &loglevel,
+// 		S3ForcePathStyle:     aws.Bool(true),
+// 		S3Disable100Continue: aws.Bool(true),
+// 		// Comment following to use default transport
+// 		HTTPClient: &http.Client{Transport: HTTPTransport},
+// 	}
+// 	session := session.New(awsConfig)
+// 	client := s3.New(session)
+// 	if client == nil {
+// 		log.Fatalf("FATAL: Unable to create new client.")
+// 	}
+// 	// Return success
+// 	return client
+// }
+//
+// // canonicalAmzHeaders -- return the x-amz headers canonicalized
+// func canonicalAmzHeaders(req *http.Request) string {
+// 	// Parse out all x-amz headers
+// 	var headers []string
+// 	for header := range req.Header {
+// 		norm := strings.ToLower(strings.TrimSpace(header))
+// 		if strings.HasPrefix(norm, "x-amz") {
+// 			headers = append(headers, norm)
+// 		}
+// 	}
+// 	// Put them in sorted order
+// 	sort.Strings(headers)
+// 	// Now add back the values
+// 	for n, header := range headers {
+// 		headers[n] = header + ":" + strings.Replace(req.Header.Get(header), "\n", " ", -1)
+// 	}
+// 	// Finally, put them back together
+// 	if len(headers) > 0 {
+// 		return strings.Join(headers, "\n") + "\n"
+// 	} else {
+// 		return ""
+// 	}
+// }
+//
+// func hmacSHA1(key []byte, content string) []byte {
+// 	mac := hmac.New(sha1.New, key)
+// 	mac.Write([]byte(content))
+// 	return mac.Sum(nil)
+// }
+//
+// func setSignature(req *http.Request) {
+// 	// Setup default parameters
+// 	dateHdr := time.Now().UTC().Format("20060102T150405Z")
+// 	req.Header.Set("X-Amz-Date", dateHdr)
+// 	// Get the canonical resource and header
+// 	canonicalResource := req.URL.EscapedPath()
+// 	canonicalHeaders := canonicalAmzHeaders(req)
+// 	stringToSign := req.Method + "\n" + req.Header.Get("Content-MD5") + "\n" + req.Header.Get("Content-Type") + "\n\n" +
+// 		canonicalHeaders + canonicalResource
+// 	hash := hmacSHA1([]byte(secret_key), stringToSign)
+// 	signature := base64.StdEncoding.EncodeToString(hash)
+// 	req.Header.Set("Authorization", fmt.Sprintf("AWS %s:%s", access_key, signature))
+// }
 
 type IntervalStats struct {
 	loop         int
@@ -472,7 +468,17 @@ func (stats *Stats) finish(thread_num int) {
 
 func runUpload(thread_num int, fendtime time.Time, stats *Stats) {
 	errcnt := 0
-	svc := s3.New(session.New(), cfg)
+
+	ctx := context.Background()
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		return fmt.Errorf("storage.NewClient: %v", err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(ctx, time.Second*50)
+	defer cancel()
+
 	for {
 		if duration_secs > -1 && time.Now().After(endtime) {
 			break
@@ -486,16 +492,11 @@ func runUpload(thread_num int, fendtime time.Time, stats *Stats) {
 		fileobj := bytes.NewReader(object_data)
 
 		key := fmt.Sprintf("%s%012d", object_prefix, objnum)
-		r := &s3.PutObjectInput{
-			Bucket: &buckets[bucket_num],
-			Key:    &key,
-			Body:   fileobj,
-		}
+		o := client.Bucket(&buckets[bucket_num]).Object(&key)
+
 		start := time.Now().UnixNano()
-		req, _ := svc.PutObjectRequest(r)
-		// Disable payload checksum calculation (very expensive)
-		req.HTTPRequest.Header.Add("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
-		err := req.Send()
+		wc := o.NewWriter(ctx)
+		_, err = io.Copy(wc, f)
 		end := time.Now().UnixNano()
 		stats.updateIntervals(thread_num)
 
@@ -666,8 +667,6 @@ func runBucketList(thread_num int, stats *Stats) {
 	atomic.AddInt64(&running_threads, -1)
 }
 
-var cfg *aws.Config
-
 func runBucketsInit(thread_num int, stats *Stats) {
 	svc := s3.New(session.New(), cfg)
 
@@ -822,8 +821,7 @@ func runWrapper(loop int, r rune) []OutputStats {
 func init() {
 	// Parse command line
 	myflag := flag.NewFlagSet("myflag", flag.ExitOnError)
-	myflag.StringVar(&access_key, "a", os.Getenv("AWS_ACCESS_KEY_ID"), "Access key")
-	myflag.StringVar(&secret_key, "s", os.Getenv("AWS_SECRET_ACCESS_KEY"), "Secret key")
+	myflag.StringVar(&key_file, "k", os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"), "Path to Google Application Credentials")
 	myflag.StringVar(&url_host, "u", os.Getenv("AWS_HOST"), "URL for host with method prefix")
 	myflag.StringVar(&object_prefix, "op", "", "Prefix for objects")
 	myflag.StringVar(&bucket_prefix, "bp", "hotsauce-bench", "Prefix for buckets")
@@ -846,11 +844,11 @@ NOTES:
   - Valid mode types for the -m mode string are:
     c: clear all existing objects from buckets (requires lookups)
     x: delete buckets
-    i: initialize buckets 
+    i: initialize buckets
     p: put objects in buckets
     l: list objects in buckets
     g: get objects from buckets
-    d: delete objects from buckets 
+    d: delete objects from buckets
 
     These modes are processed in-order and can be repeated, ie "ippgd" will
     initialize the buckets, put the objects, reput the objects, get the
@@ -859,7 +857,7 @@ NOTES:
 
   - When performing bucket listings, many S3 storage systems limit the
     maximum number of keys returned to 1000 even if MaxKeys is set higher.
-    hsbench will attempt to set MaxKeys to whatever value is passed via the 
+    hsbench will attempt to set MaxKeys to whatever value is passed via the
     "mk" flag, but it's likely that any values above 1000 will be ignored.
 `
 	myflag.Usage = func() {
@@ -877,11 +875,8 @@ NOTES:
 	if object_count < 0 && duration_secs < 0 {
 		log.Fatal("The number of objects and duration can not both be unlimited")
 	}
-	if access_key == "" {
-		log.Fatal("Missing argument -a for access key.")
-	}
-	if secret_key == "" {
-		log.Fatal("Missing argument -s for secret key.")
+	if key_file == "" {
+		log.Fatal("Missing argument -k for key file.")
 	}
 	if url_host == "" {
 		log.Fatal("Missing argument -u for host endpoint.")
@@ -923,15 +918,6 @@ func initData() {
 func main() {
 	// Hello
 	log.Printf("Hotsauce S3 Benchmark Version 0.1")
-
-	cfg = &aws.Config{
-		Endpoint:    aws.String(url_host),
-		Credentials: credentials.NewStaticCredentials(access_key, secret_key, ""),
-		Region:      aws.String(region),
-		// DisableParamValidation:  aws.Bool(true),
-		DisableComputeChecksums: aws.Bool(true),
-		S3ForcePathStyle:        aws.Bool(true),
-	}
 
 	// Echo the parameters
 	log.Printf("Parameters:")
